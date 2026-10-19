@@ -1,3 +1,5 @@
+> **This fork adds OIDC login and account-isolated workspaces to DBX Web in a single backend process.** See the [Chinese comparison with upstream](docs/fork-differences.zh-CN.md) for changes, limitations, and deployment links.
+
 <div align="center">
   <p style="font-size: 18px; white-space: nowrap;"><strong>100+ databases in 25 MB. Desktop, Docker, CLI, built-in AI assistant, and MCP Server.</strong></p>
 

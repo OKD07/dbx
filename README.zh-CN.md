@@ -1,3 +1,5 @@
+> **本仓库基于 [官方 DBX](https://github.com/t8y2/dbx) 增加了 OIDC 单进程多账号 Web 模式。** 账号数据隔离、部署方法及功能限制见 [本仓库与官方版的区别](docs/fork-differences.zh-CN.md)；常规单用户使用方式仍可参考下方原项目说明。
+
 <div align="center">
   <p style="font-size: 18px; white-space: nowrap;"><strong>25 MB 驾驭 100+ 种数据库。桌面端、Docker、CLI、内置 AI 助手与 MCP Server。</strong></p>
 
@@ -496,7 +498,7 @@ environment:
 
 浏览器访问 `http://localhost:4224`。支持 amd64 / arm64 双架构镜像。
 
-如需用 OpenID Connect 登录并为每个账号提供独立的 Web 工作区，请参阅 [OIDC 多账号部署说明](docs/oidc-multitenant.md)。
+如需用 OpenID Connect 登录并为每个账号提供独立的 Web 工作区，请参阅 [与官方版的区别](docs/fork-differences.zh-CN.md)及 [OIDC 多账号部署说明](docs/oidc-multitenant.md)。
 
 ## 快速开始
 
