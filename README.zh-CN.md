@@ -496,6 +496,8 @@ environment:
 
 浏览器访问 `http://localhost:4224`。支持 amd64 / arm64 双架构镜像。
 
+如需用 OpenID Connect 登录并为每个账号提供独立的 Web 工作区，请参阅 [OIDC 多账号部署说明](docs/oidc-multitenant.md)。
+
 ## 快速开始
 
 ### 环境要求

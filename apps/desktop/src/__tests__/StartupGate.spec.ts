@@ -58,12 +58,12 @@ beforeEach(() => {
   vi.doMock("@/components/auth/LoginPage.vue", () => ({
     __esModule: true,
     default: defineComponent({
-      props: ["setupMode"],
+      props: ["setupMode", "provider"],
       emits: ["authenticated"],
       setup:
         (props, { emit }) =>
         () =>
-          h("button", { "data-login": "", onClick: () => emit("authenticated") }, props.setupMode ? "setup" : "login"),
+          h("button", { "data-login": "", onClick: () => emit("authenticated") }, props.setupMode ? "setup" : props.provider === "oidc" ? "oidc" : "login"),
     }),
   }));
   vi.doMock("@/components/migration/SecurityMigrationWizard.vue", () => ({
@@ -146,6 +146,14 @@ describe("startup boundary", () => {
     await vi.waitFor(() => expect(root.querySelector("main")).not.toBeNull());
     expect(mocks.migrationStatus).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("selects the OIDC login path reported by the server", async () => {
+    mocks.desktop.mockReturnValue(false);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({ required: true, authenticated: false, setup_required: false, provider: "oidc" }) }));
+    await mountGate();
+    await vi.waitFor(() => expect(root.querySelector("[data-login]")?.textContent).toBe("oidc"));
+    expect(mocks.appImported).not.toHaveBeenCalled();
   });
 
   it("does not load the business app until a required migration is completed and entered", async () => {

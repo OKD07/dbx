@@ -17,6 +17,7 @@ use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher};
 use axum::extract::DefaultBodyLimit;
+use axum::extract::Request as AxumRequest;
 
 /// Login/setup payloads are one password field; 64 KiB is generous.
 const AUTH_BODY_LIMIT_BYTES: usize = 64 * 1024;
@@ -34,6 +35,8 @@ use dbx_mcp::{streamable_http_router, DbxBackend, LocalBackend};
 use state::WebState;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
+use tokio::sync::Mutex;
+use tower::ServiceExt;
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::compression::CompressionLayer;
 use utoipa::OpenApi;
@@ -516,123 +519,7 @@ fn web_mcp_startup_error(error: String) -> String {
     format!("Failed to start DBX Web: invalid Web MCP configuration: {error}")
 }
 
-async fn serve() -> Result<(), String> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "dbx_web=info,tower_http=info".parse().unwrap()),
-        )
-        .init();
-
-    rustls::crypto::aws_lc_rs::default_provider().install_default().expect("Failed to install rustls crypto provider");
-
-    // Data directory
-    let data_dir = std::env::var("DBX_DATA_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        std::path::PathBuf::from(home).join(".dbx-web")
-    });
-    std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
-
-    let app_state = {
-        let db_path = data_dir.join("dbx.db");
-        let storage = Storage::open_unmigrated(&db_path)
-            .await
-            .expect("Failed to open storage")
-            .with_secret_key_policy(SecretKeyPolicy::ManagedDataDir);
-
-        // Initialize core dialect registry and load external plugin dialects
-        register_core_dialects();
-        let registry = DialectRegistry::global();
-        let plugin_dirs = vec![data_dir.join("plugins").join("dialects")];
-        let load_result = DialectPluginLoader::scan_and_load(registry, &plugin_dirs);
-        log::info!(
-            "Dialect plugins loaded: {} success, {} errors, {} skipped",
-            load_result.loaded.len(),
-            load_result.errors.len(),
-            load_result.skipped.len()
-        );
-
-        // Start dialect YAML hot-reload watcher
-        let watch_dirs = plugin_dirs.clone();
-        tokio::spawn(async move {
-            if let Err(e) = DialectHotReload::run_forever(watch_dirs, DialectRegistry::global()).await {
-                log::error!("Dialect hot-reload watcher exited: {e}");
-            }
-        });
-        log::info!("Dialect hot-reload watcher started");
-
-        Arc::new(AppState::new_with_plugin_and_agent_dir_and_app_version(
-            storage,
-            data_dir.join("plugins"),
-            web_agent_dir(&data_dir),
-            env!("CARGO_PKG_VERSION"),
-        ))
-    };
-
-    // Password hash: env var takes priority, then database
-    let password_disabled = std::env::var("DBX_DISABLE_PASSWORD")
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-    let password_viewer_enabled =
-        password_viewer_enabled_from_env(std::env::var("DBX_DISABLE_PASSWORD_VIEWER").ok().as_deref());
-
-    let password_hash = if password_disabled {
-        None
-    } else if let Ok(pw) = std::env::var("DBX_PASSWORD") {
-        let salt = SaltString::generate(&mut OsRng);
-        Some(Argon2::default().hash_password(pw.as_bytes(), &salt).expect("Failed to hash password").to_string())
-    } else {
-        app_state.storage.load_password_hash().await.unwrap_or(None)
-    };
-
-    let public_base_path = normalize_public_base_path(std::env::var("DBX_PUBLIC_BASE_PATH").ok());
-
-    let demo_mode = demo::demo_mode_from_env();
-
-    let migration_ready = storage_migration_ready(&app_state).await;
-    let web_mcp = Arc::new(if migration_ready {
-        WebMcpRuntime::load(&app_state.storage, !password_disabled && password_hash.is_some())
-            .await
-            .map_err(web_mcp_startup_error)?
-    } else {
-        WebMcpRuntime::disabled()
-    });
-    let web_state = Arc::new(WebState {
-        app: app_state,
-        data_dir,
-        notes_roots: routes::docs::notes_roots_from_env(std::env::var_os("DBX_DOCS_NOTES_ROOTS").as_deref()),
-        public_base_path: public_base_path.clone(),
-        demo_mode,
-        password_disabled,
-        password_viewer_enabled,
-        password_hash: RwLock::new(password_hash),
-        sessions: RwLock::new(HashSet::new()),
-        sse_channels: RwLock::new(HashMap::new()),
-        transfer_progress_channels: RwLock::new(HashMap::new()),
-        table_import_channels: RwLock::new(HashMap::new()),
-        sql_file_executions: RwLock::new(HashMap::new()),
-        sql_file_failure_logs: Default::default(),
-        managed_sql_previews: Default::default(),
-        nacos_imports: RwLock::new(HashMap::new()),
-        login_rate_limit: tokio::sync::Mutex::new(state::LoginRateLimit { fail_count: 0, locked_until: None }),
-        export_files: RwLock::new(HashMap::new()),
-        ssh_prompts: Arc::new(ssh_prompt::SshPromptHub::new()),
-        migration_ready: Arc::new(AtomicBool::new(migration_ready)),
-        web_mcp,
-    });
-
-    ssh_prompt::install_web_ssh_prompt_bridge(web_state.ssh_prompts.clone());
-    routes::sql_file::start_sql_file_cleanup(&web_state);
-    routes::connection::start_connection_idle_sweeper(&web_state);
-
-    let backup_root = std::env::var_os("DBX_BACKUP_ROOT")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| web_state.data_dir.join("backups"));
-    std::fs::create_dir_all(&backup_root).expect("Failed to create server backup root");
-    let backup_service = routes::scheduled_backup::service(&web_state).expect("Failed to resolve server backup root");
-    let backup_stop = tokio_util::sync::CancellationToken::new();
-    let backup_worker = backup_service.start(backup_stop.clone());
-
+fn build_app(web_state: Arc<WebState>, public_base_path: &str) -> Result<Router, String> {
     // API routes
     let api = Router::new()
         .route("/migration/status", get(routes::migration::status))
@@ -1572,6 +1459,327 @@ async fn serve() -> Result<(), String> {
     };
     app = mount_static_assets(app, &public_base_path, static_source);
 
+    Ok(app)
+}
+
+struct TenantRouters {
+    root: std::path::PathBuf,
+    secret: String,
+    max_active: usize,
+    routers: Mutex<HashMap<String, Router>>,
+}
+
+fn same_secret(provided: &str, expected: &str) -> bool {
+    if provided.len() != expected.len() {
+        return false;
+    }
+    provided.bytes().zip(expected.bytes()).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0
+}
+
+fn blocked_multitenant_path(path: &str) -> bool {
+    ["/api/plugins", "/api/agents", "/api/docs", "/api/ssh-prompt", "/api/sql-file",
+     "/api/table-import", "/api/database-backups", "/api/cloud-sync", "/api/export",
+     "/api/import", "/api/transfer", "/api/jdbc", "/api/ssh", "/api/tunnel-profiles",
+     "/api/ai", "/api/update", "/api/plugin", "/api/system", "/mcp"]
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+}
+
+fn safe_multitenant_connection(config: &serde_json::Value) -> bool {
+    // Only built-in, network-only drivers are accepted. In particular, SQLite,
+    // DuckDB, agents and plugins can read files with the gateway's OS identity.
+    let Some(db_type) = config.get("db_type").and_then(|value| value.as_str()) else { return false };
+    if !["mysql", "postgres", "rqlite", "cloudflare-d1", "redis", "clickhouse", "sqlserver",
+        "elasticsearch", "easysearch", "meilisearch", "solr", "couchdb", "qdrant", "chromadb",
+        "milvus", "weaviate", "doris", "starrocks", "manticoresearch", "redshift", "gaussdb",
+        "kwdb", "opengauss", "questdb", "influxdb3", "victoriametrics", "nacos", "consul",
+        "mq", "mqtt"].contains(&db_type) { return false; }
+    let Some(host) = config.get("host").and_then(|value| value.as_str()) else { return false };
+    if host.is_empty() || host.starts_with('/') || host.starts_with("file:") || host.starts_with("unix:")
+        || host.contains('\\') || host.contains('\0') { return false; }
+    for key in ["ca_cert_path", "client_cert_path", "client_key_path", "docs_notes_path", "connection_string",
+        "driver_profile", "init_script", "url_params", "oracle_oci_tns_admin", "oracle_oci_nls_lang"] {
+        if config.get(key).is_some_and(|value| !value.is_null() && value.as_str().is_none_or(|text| !text.is_empty())) {
+            return false;
+        }
+    }
+    for key in ["agent_java_options", "attached_databases", "transport_layers"] {
+        if config.get(key).is_some_and(|value| value.as_array().is_none_or(|items| !items.is_empty())) {
+            return false;
+        }
+    }
+    true
+}
+
+fn multitenant_connection_payload_is_safe(path: &str, body: &serde_json::Value) -> bool {
+    if path == "/api/connection/save" {
+        return body.get("configs").and_then(|value| value.as_array())
+            .is_some_and(|configs| configs.iter().all(safe_multitenant_connection));
+    }
+    body.get("config").is_some_and(safe_multitenant_connection)
+}
+
+async fn new_tenant_state(data_dir: std::path::PathBuf) -> Result<Arc<WebState>, String> {
+    std::fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+    }
+    let storage = Storage::open_unmigrated(&data_dir.join("dbx.db"))
+        .await
+        .map_err(|error| error.to_string())?
+        .with_secret_key_policy(SecretKeyPolicy::ManagedDataDir);
+    let app = Arc::new(AppState::new_with_plugin_and_agent_dir_and_app_version(
+        storage,
+        data_dir.join("plugins"),
+        data_dir.join("agents"),
+        env!("CARGO_PKG_VERSION"),
+    ));
+    let migration_ready = storage_migration_ready(&app).await;
+    let state = Arc::new(WebState {
+        app,
+        data_dir,
+        notes_roots: Vec::new(),
+        public_base_path: "/".to_string(),
+        demo_mode: false,
+        password_disabled: true,
+        password_viewer_enabled: false,
+        password_hash: RwLock::new(None),
+        sessions: RwLock::new(HashSet::new()),
+        sse_channels: RwLock::new(HashMap::new()),
+        transfer_progress_channels: RwLock::new(HashMap::new()),
+        table_import_channels: RwLock::new(HashMap::new()),
+        sql_file_executions: RwLock::new(HashMap::new()),
+        sql_file_failure_logs: Default::default(),
+        managed_sql_previews: Default::default(),
+        nacos_imports: RwLock::new(HashMap::new()),
+        login_rate_limit: Mutex::new(state::LoginRateLimit { fail_count: 0, locked_until: None }),
+        export_files: RwLock::new(HashMap::new()),
+        ssh_prompts: Arc::new(ssh_prompt::SshPromptHub::new()),
+        migration_ready: Arc::new(AtomicBool::new(migration_ready)),
+        web_mcp: Arc::new(WebMcpRuntime::disabled()),
+    });
+    routes::sql_file::start_sql_file_cleanup(&state);
+    routes::connection::start_connection_idle_sweeper(&state);
+    Ok(state)
+}
+
+async fn multitenant_request(
+    axum::extract::State(tenants): axum::extract::State<Arc<TenantRouters>>,
+    mut request: AxumRequest,
+) -> Response {
+    let headers = request.headers();
+    let secret = headers.get("x-dbx-internal-secret").and_then(|value| value.to_str().ok()).unwrap_or("");
+    let key = headers.get("x-dbx-tenant-key").and_then(|value| value.to_str().ok()).unwrap_or("").to_owned();
+    if !same_secret(secret, &tenants.secret) || key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if blocked_multitenant_path(request.uri().path()) || request.uri().path() == "/api/connection/test-ssh-tunnel" {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let path = request.uri().path().to_owned();
+    if ["/api/connection/save", "/api/connection/connect", "/api/connection/test",
+        "/api/connection/test-info", "/api/connection/mcp/add"].contains(&path.as_str()) {
+        let (parts, body) = request.into_parts();
+        let bytes = match axum::body::to_bytes(body, 2 * 1024 * 1024).await {
+            Ok(bytes) => bytes,
+            Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        };
+        let json = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(json) => json,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
+        if !multitenant_connection_payload_is_safe(&path, &json) {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        request = axum::http::Request::from_parts(parts, axum::body::Body::from(bytes));
+    }
+    let router = {
+        let mut routers = tenants.routers.lock().await;
+        if let Some(router) = routers.get(&key) {
+            router.clone()
+        } else {
+            if routers.len() >= tenants.max_active {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            let data_dir = tenants.root.join("tenants").join(&key);
+            let state = match new_tenant_state(data_dir).await {
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::error!("Could not initialize tenant: {error}");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+            let router = match build_app(state, "/") {
+                Ok(router) => router,
+                Err(error) => {
+                    tracing::error!("Could not build tenant router: {error}");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+            routers.insert(key, router.clone());
+            router
+        }
+    };
+    router.oneshot(request).await.unwrap_or_else(|never| match never {})
+}
+
+async fn serve_multitenant(secret: String) -> Result<(), String> {
+    if secret.len() < 32 {
+        return Err("DBX_MULTITENANT_SECRET must contain at least 32 characters".into());
+    }
+    let root = std::env::var("DBX_DATA_DIR").map(std::path::PathBuf::from)
+        .map_err(|_| "DBX_DATA_DIR is required in multi-tenant mode".to_string())?;
+    std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+        let tenants_dir = root.join("tenants");
+        std::fs::create_dir_all(&tenants_dir).map_err(|error| error.to_string())?;
+        std::fs::set_permissions(&tenants_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+    }
+    let max_active = std::env::var("DBX_MAX_ACTIVE_TENANTS").ok()
+        .and_then(|value| value.parse::<usize>().ok()).filter(|value| *value > 0).unwrap_or(32);
+    register_core_dialects();
+    let port: u16 = std::env::var("DBX_PORT").ok().and_then(|value| value.parse().ok()).unwrap_or(4224);
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await.map_err(|error| error.to_string())?;
+    let tenants = Arc::new(TenantRouters { root, secret, max_active, routers: Mutex::new(HashMap::new()) });
+    let app = Router::new().fallback(axum::routing::any(multitenant_request)).with_state(tenants);
+    tracing::info!("DBX single-process tenant service listening on 127.0.0.1:{port}");
+    axum::serve(listener, app).with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    }).await.map_err(|error| error.to_string())
+}
+
+async fn serve() -> Result<(), String> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "dbx_web=info,tower_http=info".parse().unwrap()),
+        )
+        .init();
+
+    rustls::crypto::aws_lc_rs::default_provider().install_default().expect("Failed to install rustls crypto provider");
+
+    if let Ok(secret) = std::env::var("DBX_MULTITENANT_SECRET") {
+        return serve_multitenant(secret).await;
+    }
+
+    // Data directory
+    let data_dir = std::env::var("DBX_DATA_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        std::path::PathBuf::from(home).join(".dbx-web")
+    });
+    std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
+
+    let app_state = {
+        let db_path = data_dir.join("dbx.db");
+        let storage = Storage::open_unmigrated(&db_path)
+            .await
+            .expect("Failed to open storage")
+            .with_secret_key_policy(SecretKeyPolicy::ManagedDataDir);
+
+        // Initialize core dialect registry and load external plugin dialects
+        register_core_dialects();
+        let registry = DialectRegistry::global();
+        let plugin_dirs = vec![data_dir.join("plugins").join("dialects")];
+        let load_result = DialectPluginLoader::scan_and_load(registry, &plugin_dirs);
+        log::info!(
+            "Dialect plugins loaded: {} success, {} errors, {} skipped",
+            load_result.loaded.len(),
+            load_result.errors.len(),
+            load_result.skipped.len()
+        );
+
+        // Start dialect YAML hot-reload watcher
+        let watch_dirs = plugin_dirs.clone();
+        tokio::spawn(async move {
+            if let Err(e) = DialectHotReload::run_forever(watch_dirs, DialectRegistry::global()).await {
+                log::error!("Dialect hot-reload watcher exited: {e}");
+            }
+        });
+        log::info!("Dialect hot-reload watcher started");
+
+        Arc::new(AppState::new_with_plugin_and_agent_dir_and_app_version(
+            storage,
+            data_dir.join("plugins"),
+            web_agent_dir(&data_dir),
+            env!("CARGO_PKG_VERSION"),
+        ))
+    };
+
+    // Password hash: env var takes priority, then database
+    let password_disabled = std::env::var("DBX_DISABLE_PASSWORD")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let password_viewer_enabled =
+        password_viewer_enabled_from_env(std::env::var("DBX_DISABLE_PASSWORD_VIEWER").ok().as_deref());
+
+    let password_hash = if password_disabled {
+        None
+    } else if let Ok(pw) = std::env::var("DBX_PASSWORD") {
+        let salt = SaltString::generate(&mut OsRng);
+        Some(Argon2::default().hash_password(pw.as_bytes(), &salt).expect("Failed to hash password").to_string())
+    } else {
+        app_state.storage.load_password_hash().await.unwrap_or(None)
+    };
+
+    let public_base_path = normalize_public_base_path(std::env::var("DBX_PUBLIC_BASE_PATH").ok());
+
+    let demo_mode = demo::demo_mode_from_env();
+
+    let migration_ready = storage_migration_ready(&app_state).await;
+    let web_mcp = Arc::new(if migration_ready {
+        WebMcpRuntime::load(&app_state.storage, !password_disabled && password_hash.is_some())
+            .await
+            .map_err(web_mcp_startup_error)?
+    } else {
+        WebMcpRuntime::disabled()
+    });
+    let web_state = Arc::new(WebState {
+        app: app_state,
+        data_dir,
+        notes_roots: routes::docs::notes_roots_from_env(std::env::var_os("DBX_DOCS_NOTES_ROOTS").as_deref()),
+        public_base_path: public_base_path.clone(),
+        demo_mode,
+        password_disabled,
+        password_viewer_enabled,
+        password_hash: RwLock::new(password_hash),
+        sessions: RwLock::new(HashSet::new()),
+        sse_channels: RwLock::new(HashMap::new()),
+        transfer_progress_channels: RwLock::new(HashMap::new()),
+        table_import_channels: RwLock::new(HashMap::new()),
+        sql_file_executions: RwLock::new(HashMap::new()),
+        sql_file_failure_logs: Default::default(),
+        managed_sql_previews: Default::default(),
+        nacos_imports: RwLock::new(HashMap::new()),
+        login_rate_limit: tokio::sync::Mutex::new(state::LoginRateLimit { fail_count: 0, locked_until: None }),
+        export_files: RwLock::new(HashMap::new()),
+        ssh_prompts: Arc::new(ssh_prompt::SshPromptHub::new()),
+        migration_ready: Arc::new(AtomicBool::new(migration_ready)),
+        web_mcp,
+    });
+
+    ssh_prompt::install_web_ssh_prompt_bridge(web_state.ssh_prompts.clone());
+    routes::sql_file::start_sql_file_cleanup(&web_state);
+    routes::connection::start_connection_idle_sweeper(&web_state);
+
+    let backup_root = std::env::var_os("DBX_BACKUP_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| web_state.data_dir.join("backups"));
+    std::fs::create_dir_all(&backup_root).expect("Failed to create server backup root");
+    let backup_service = routes::scheduled_backup::service(&web_state).expect("Failed to resolve server backup root");
+    let backup_stop = tokio_util::sync::CancellationToken::new();
+    let backup_worker = backup_service.start(backup_stop.clone());
+
+    let app = build_app(web_state.clone(), &public_base_path)?;
+
     // Bind address
     let port: u16 = std::env::var("DBX_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(4224);
     // Defaults to all interfaces for container deployments; operators who
@@ -1696,6 +1904,19 @@ mod tests {
     use axum::routing::{get, post};
     use axum::Router;
     use tower_http::compression::predicate::Predicate;
+
+    #[test]
+    fn single_process_tenant_policy_rejects_file_drivers_and_server_paths() {
+        let remote = serde_json::json!({ "db_type": "postgres", "host": "db.example.com", "transport_layers": [] });
+        assert!(super::safe_multitenant_connection(&remote));
+        assert!(!super::safe_multitenant_connection(&serde_json::json!({ "db_type": "sqlite", "host": "/etc/passwd" })));
+        assert!(!super::safe_multitenant_connection(&serde_json::json!({ "db_type": "postgres", "ca_cert_path": "/etc/passwd" })));
+        assert!(super::blocked_multitenant_path("/api/plugins/install"));
+        assert!(super::blocked_multitenant_path("/api/sql-file/upload"));
+        assert!(!super::blocked_multitenant_path("/api/connection/list"));
+        assert!(super::same_secret("abcd", "abcd"));
+        assert!(!super::same_secret("abce", "abcd"));
+    }
 
     #[tokio::test]
     async fn migration_http_gate_blocks_business_until_ready_but_allows_cleanup_handler() {

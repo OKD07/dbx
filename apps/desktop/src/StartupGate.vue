@@ -7,6 +7,7 @@ import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { webPath } from "@/lib/common/webPath";
 import { loadSavedLocale } from "@/i18n";
 import { checkStartupAuthentication, type StartupAuthentication } from "@/lib/startup/startupAuthentication";
+import { ensureTenantBrowserIsolation, reloadOnTenantSwitch } from "@/lib/startup/tenantBrowserIsolation";
 import { markStartupPhase } from "@/lib/startup/startupTiming";
 import { retryStartupAfterPreloadFailure } from "@/lib/startup/startupPreloadRecovery";
 import { initializePasswordViewerCapability } from "@/lib/security/passwordViewer";
@@ -39,6 +40,7 @@ const checkingLocale = ref(Boolean(props.localeReady));
 const localeFailed = ref(false);
 let initialLocaleReady = props.localeReady;
 let authRequest: AbortController | undefined;
+let stopTenantSwitchReload: (() => void) | undefined;
 
 watch(migration.blocking, (blocked) => {
   if (!blocked) markStartupPhase("migration-ready");
@@ -76,6 +78,13 @@ async function initialize() {
         history.replaceState(null, "", webPath("/login"));
         return;
       }
+      if (result.provider === "oidc") {
+        const tenantId = result.tenant_id ?? "";
+        await ensureTenantBrowserIsolation(tenantId);
+        stopTenantSwitchReload?.();
+        stopTenantSwitchReload = reloadOnTenantSwitch(tenantId);
+      }
+      if (request.signal.aborted) return;
       await initializePasswordViewerCapability();
     } else {
       await initializePasswordViewerCapability();
@@ -96,11 +105,14 @@ onMounted(() => {
   void initializeLocale();
   void initialize();
 });
-onUnmounted(() => authRequest?.abort());
+onUnmounted(() => {
+  authRequest?.abort();
+  stopTenantSwitchReload?.();
+});
 </script>
 <template>
   <StartupLoading v-if="checkingLocale || localeFailed || checkingAuth || authFailed" :label="authFailed ? t('migration.authFailed') : !checkingLocale && !localeFailed ? t('migration.checking') : undefined" :error="localeFailed || authFailed" :retry="localeFailed ? initializeLocale : initialize" />
-  <LoginPage v-else-if="loginRequired" :setup-mode="setupRequired" @authenticated="authenticated" />
+  <LoginPage v-else-if="loginRequired" :setup-mode="setupRequired" :provider="startupAuthentication?.provider" @authenticated="authenticated" />
   <SecurityMigrationWizard v-else-if="blocking" :store="migration" />
   <App v-else :startup-authentication="startupAuthentication" />
 </template>

@@ -498,6 +498,9 @@ and the browser displays the data security upgrade screen.
 When running the binary directly, set `DBX_DATA_DIR=/var/lib/dbx` to use
 `/var/lib/dbx/.dbx/secret.key` with the same lifecycle and backup rules.
 
+For one isolated Web workspace per OpenID Connect account, see the
+[OIDC multi-account deployment guide](docs/oidc-multitenant.md).
+
 When upgrading from a release that stored credentials in plain text, Desktop
 and Web display a **Data Security Upgrade** wizard before opening the main
 application. Choose **Start upgrade** to create a restricted backup, migrate

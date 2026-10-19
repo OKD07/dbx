@@ -11,8 +11,9 @@ import { translateBackendError } from "@/i18n/backend-errors";
 const props = withDefaults(
   defineProps<{
     setupMode?: boolean;
+    provider?: "password" | "oidc";
   }>(),
-  { setupMode: false },
+  { setupMode: false, provider: "password" },
 );
 
 const emit = defineEmits<{ authenticated: [] }>();
@@ -64,6 +65,10 @@ async function submit() {
     loading.value = false;
   }
 }
+
+function signInWithOidc() {
+  window.location.assign(apiUrl("/api/auth/oidc/start"));
+}
 </script>
 
 <template>
@@ -79,7 +84,10 @@ async function submit() {
         </div>
       </div>
 
-      <form class="space-y-4" @submit.prevent="submit" autocomplete="off">
+      <Button v-if="provider === 'oidc'" type="button" class="w-full h-11 text-sm font-medium" @click="signInWithOidc">
+        {{ t("auth.login") }}
+      </Button>
+      <form v-else class="space-y-4" @submit.prevent="submit" autocomplete="off">
         <div v-if="setupMode" class="flex items-center justify-center gap-2 text-sm text-muted-foreground">
           <ShieldCheck class="w-4 h-4" />
           <span>{{ t("auth.setupTitle") }}</span>

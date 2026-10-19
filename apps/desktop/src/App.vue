@@ -413,6 +413,7 @@ let updateCheckTimer: ReturnType<typeof setInterval> | undefined;
 const needsAuth = ref(!isDesktop && (startupProps.startupAuthentication?.required ?? true));
 const authenticated = ref(isDesktop || (startupProps.startupAuthentication?.authenticated ?? false));
 const setupRequired = ref(!isDesktop && (startupProps.startupAuthentication?.setup_required ?? false));
+const authProvider = ref(startupProps.startupAuthentication?.provider);
 const { isMaximized: windowMaximized, isFullscreen: windowFullscreen } = useWindowControls();
 // The Rust side injects this flag into the main window only when a compositing manager is
 // running (see create_linux_main_window); detached-tab and plugin windows never get it.
@@ -5111,6 +5112,7 @@ onMounted(async () => {
         needsAuth.value = data.required;
         authenticated.value = data.authenticated;
         setupRequired.value = data.setup_required;
+        authProvider.value = data.provider;
       } catch {
         /* server unreachable */
       }
@@ -5194,7 +5196,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <LoginPage v-if="setupRequired || (needsAuth && !authenticated)" :setup-mode="setupRequired" @authenticated="onLoginSuccess" />
+  <LoginPage v-if="setupRequired || (needsAuth && !authenticated)" :setup-mode="setupRequired" :provider="authProvider" @authenticated="onLoginSuccess" />
   <div v-show="!setupRequired && (!needsAuth || authenticated)" class="dbx-app-root fixed inset-0 h-screen w-screen overflow-hidden">
     <div v-if="appBackgroundActive && appBackgroundObjectUrl" data-app-background class="pointer-events-none fixed inset-0 -z-10 overflow-hidden">
       <div class="h-full w-full" :style="appBackgroundImageStyle"></div>
